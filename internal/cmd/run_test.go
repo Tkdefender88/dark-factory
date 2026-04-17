@@ -2,14 +2,18 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/peter-stratton/dark-factory/internal/config"
 	"github.com/peter-stratton/dark-factory/internal/github"
+	"github.com/peter-stratton/dark-factory/internal/logging"
 	"github.com/peter-stratton/dark-factory/internal/progress"
 	"github.com/spf13/cobra"
 )
@@ -270,5 +274,307 @@ func TestTagResolutionSurfacesConfigError(t *testing.T) {
 	// the actual config problem so users can fix their godark.yaml.
 	if strings.Contains(err.Error(), "repo is required") {
 		t.Errorf("config.Load error should describe the real problem, got: %v", err)
+	}
+}
+
+// wrapFactoryForTUI mirrors the factory-wrap closure built in run.go's RunE
+// when useTUI is true. Keeping the helper here lets tests exercise the exact
+// composition pattern without invoking the Cobra command.
+func wrapFactoryForTUI(orig func(string) (*slog.Logger, error), logCh chan logging.LogLine) func(string) (*slog.Logger, error) {
+	tuiHandler := logging.NewTUIHandler(logCh, slog.LevelWarn)
+	return func(dir string) (*slog.Logger, error) {
+		l, err := orig(dir)
+		if err != nil {
+			return nil, err
+		}
+		return slog.New(logging.WithHandler(l.Handler(), tuiHandler)), nil
+	}
+}
+
+// TestRunTUIFactoryWrapFansOut verifies that a logger produced by the wrapped
+// factory writes warn-level records to both the JSON debug.log AND the TUI
+// channel. This is the core behavior change introduced by issue #3.
+func TestRunTUIFactoryWrapFansOut(t *testing.T) {
+	dir := t.TempDir()
+	logCh := make(chan logging.LogLine, 16)
+	factory := wrapFactoryForTUI(logging.NewLoggerFileOnly, logCh)
+
+	logger, err := factory(dir)
+	if err != nil {
+		t.Fatalf("wrapped factory returned error: %v", err)
+	}
+
+	logger.Warn("preflight-warning", "reason", "auth-missing")
+
+	select {
+	case line := <-logCh:
+		if !strings.Contains(line.Formatted, "preflight-warning") {
+			t.Errorf("log channel line missing message, got %q", line.Formatted)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for log line on TUI channel")
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "debug.log"))
+	if err != nil {
+		t.Fatalf("reading debug.log: %v", err)
+	}
+	if !strings.Contains(string(data), "preflight-warning") {
+		t.Errorf("debug.log missing message, got %q", string(data))
+	}
+
+	// Confirm debug.log is valid JSON (proof the original JSON handler is still
+	// in the fan-out chain, not shadowed by the TUI handler).
+	var rec map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("debug.log line is not JSON: %v (line=%q)", err, line)
+		}
+	}
+}
+
+// TestRunTUIFactoryWrapDropsInfo verifies that info-level records do not
+// leak onto the TUI channel (the TUI handler filters below warn) but still
+// land in the JSON debug.log.
+func TestRunTUIFactoryWrapDropsInfo(t *testing.T) {
+	dir := t.TempDir()
+	logCh := make(chan logging.LogLine, 16)
+	factory := wrapFactoryForTUI(logging.NewLoggerFileOnly, logCh)
+
+	logger, err := factory(dir)
+	if err != nil {
+		t.Fatalf("wrapped factory returned error: %v", err)
+	}
+
+	logger.Info("info-only-message")
+
+	select {
+	case line := <-logCh:
+		t.Errorf("expected no TUI channel line for info record, got %q", line.Formatted)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "debug.log"))
+	if err != nil {
+		t.Fatalf("reading debug.log: %v", err)
+	}
+	if !strings.Contains(string(data), "info-only-message") {
+		t.Errorf("debug.log missing info message, got %q", string(data))
+	}
+}
+
+// TestRunNonTUIFactoryIdentity verifies that the non-TUI branch of run.go
+// leaves logFactory equal to logging.NewLogger — no wrap, no channel.
+func TestRunNonTUIFactoryIdentity(t *testing.T) {
+	useTUI := false
+	logFactory := logging.NewLogger
+	if useTUI {
+		logFactory = logging.NewLoggerFileOnly
+	}
+	var logCh chan logging.LogLine
+	if useTUI {
+		logCh = make(chan logging.LogLine, 256)
+		logFactory = wrapFactoryForTUI(logFactory, logCh)
+	}
+
+	if logCh != nil {
+		t.Error("logCh should be nil when useTUI=false")
+	}
+	if reflect.ValueOf(logFactory).Pointer() != reflect.ValueOf(logging.NewLogger).Pointer() {
+		t.Error("logFactory should be the unwrapped logging.NewLogger when useTUI=false")
+	}
+}
+
+// runGoroutineBody mirrors the orchestrator goroutine body in run.go so that
+// its close semantics can be tested in isolation. The stubs represent
+// orchestrator.Run and runEnterWatch; errCh and the sendRunDone closure stand
+// in for the bubbletea program's Send channel.
+func runGoroutineBody(logCh chan logging.LogLine, watchFlag bool, orchRun func() error, watchRun func() error, sendRunDone func(), sendWatching func()) chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		err := orchRun()
+		if err != nil || !watchFlag {
+			errCh <- err
+			sendRunDone()
+			if logCh != nil {
+				close(logCh)
+			}
+			return
+		}
+		sendWatching()
+		werr := watchRun()
+		errCh <- werr
+		sendRunDone()
+		if logCh != nil {
+			close(logCh)
+		}
+	}()
+	return errCh
+}
+
+// TestRunGoroutineClosesLogChOnOrchestratorExit verifies that the channel is
+// closed after orchestrator.Run returns when watchFlag is false (or when the
+// orchestrator returns an error) — the TUI subscription loop depends on this
+// close to terminate cleanly.
+func TestRunGoroutineClosesLogChOnOrchestratorExit(t *testing.T) {
+	logCh := make(chan logging.LogLine, 4)
+	var runDoneCount int
+	errCh := runGoroutineBody(
+		logCh,
+		false, // watchFlag
+		func() error { return nil },
+		func() error { t.Fatal("watchRun should not be called when watchFlag=false"); return nil },
+		func() { runDoneCount++ },
+		func() { t.Fatal("sendWatching should not be called when watchFlag=false") },
+	)
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("errCh = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for goroutine to finish")
+	}
+
+	_, ok := <-logCh
+	if ok {
+		t.Error("expected logCh to be closed after orchestrator exit")
+	}
+	if runDoneCount != 1 {
+		t.Errorf("runDoneCount = %d, want 1", runDoneCount)
+	}
+}
+
+// TestRunGoroutineClosesLogChOnWatchExit verifies that when watchFlag=true and
+// the orchestrator succeeds, the channel is closed after runEnterWatch
+// returns — not before — so watch-phase log records can still reach the TUI.
+func TestRunGoroutineClosesLogChOnWatchExit(t *testing.T) {
+	logCh := make(chan logging.LogLine, 4)
+	watchStarted := make(chan struct{})
+	watchRelease := make(chan struct{})
+	var sendOrder []string
+
+	errCh := runGoroutineBody(
+		logCh,
+		true, // watchFlag
+		func() error { return nil },
+		func() error {
+			close(watchStarted)
+			<-watchRelease
+			// At this point the channel must still be open — watch runs under
+			// the same goroutine as the close call.
+			select {
+			case logCh <- logging.LogLine{Formatted: "watch-log"}:
+			default:
+				t.Error("logCh unexpectedly closed before watch returned")
+			}
+			return nil
+		},
+		func() { sendOrder = append(sendOrder, "run-done") },
+		func() { sendOrder = append(sendOrder, "watching") },
+	)
+
+	<-watchStarted
+	close(watchRelease)
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("errCh = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for goroutine to finish")
+	}
+
+	// Drain the watch-log line first, then verify close.
+	line, ok := <-logCh
+	if !ok || line.Formatted != "watch-log" {
+		t.Errorf("expected watch-log before close, got ok=%v line=%q", ok, line.Formatted)
+	}
+	_, ok = <-logCh
+	if ok {
+		t.Error("expected logCh to be closed after watch exit")
+	}
+
+	want := []string{"watching", "run-done"}
+	if !reflect.DeepEqual(sendOrder, want) {
+		t.Errorf("sendOrder = %v, want %v", sendOrder, want)
+	}
+}
+
+// TestRunGoroutineClosesLogChOnOrchestratorError verifies that an orchestrator
+// error still closes the channel (the early-return path must not leak the
+// channel and hang the TUI subscription).
+func TestRunGoroutineClosesLogChOnOrchestratorError(t *testing.T) {
+	logCh := make(chan logging.LogLine, 4)
+	wantErr := context.Canceled
+
+	errCh := runGoroutineBody(
+		logCh,
+		true, // watchFlag — irrelevant since orch errors
+		func() error { return wantErr },
+		func() error { t.Fatal("watchRun must not be called after orchestrator error"); return nil },
+		func() {},
+		func() { t.Fatal("sendWatching must not be called after orchestrator error") },
+	)
+
+	select {
+	case err := <-errCh:
+		if err != wantErr {
+			t.Errorf("errCh = %v, want %v", err, wantErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for goroutine to finish")
+	}
+
+	_, ok := <-logCh
+	if ok {
+		t.Error("expected logCh to be closed after orchestrator error")
+	}
+}
+
+// TestRunTUIFactoryRunScopedLogger verifies that every logger produced by
+// the wrapped factory — including ones produced on a subsequent call that
+// simulates orchestrator.Run's own invocation — fans out to the same shared
+// TUI handler. This guards against regressions where the wrap is applied only
+// to the bootstrap logger.
+func TestRunTUIFactoryRunScopedLogger(t *testing.T) {
+	bootstrapDir := t.TempDir()
+	runDir := t.TempDir()
+	logCh := make(chan logging.LogLine, 16)
+	factory := wrapFactoryForTUI(logging.NewLoggerFileOnly, logCh)
+
+	bootstrap, err := factory(bootstrapDir)
+	if err != nil {
+		t.Fatalf("bootstrap factory: %v", err)
+	}
+	runScoped, err := factory(runDir)
+	if err != nil {
+		t.Fatalf("run-scoped factory: %v", err)
+	}
+
+	bootstrap.Warn("bootstrap-warn")
+	runScoped.Warn("run-scoped-warn")
+
+	got := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case line := <-logCh:
+			if strings.Contains(line.Formatted, "bootstrap-warn") {
+				got["bootstrap-warn"] = true
+			}
+			if strings.Contains(line.Formatted, "run-scoped-warn") {
+				got["run-scoped-warn"] = true
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for log line %d", i)
+		}
+	}
+	if !got["bootstrap-warn"] || !got["run-scoped-warn"] {
+		t.Errorf("expected both warns on TUI channel, got %v", got)
 	}
 }

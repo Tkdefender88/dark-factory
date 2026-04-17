@@ -77,6 +77,23 @@ Use "godark implement" to process individual issues by number.`,
 			logFactory = logging.NewLoggerFileOnly
 		}
 
+		// In TUI mode, wrap the factory so every logger it produces — including
+		// the run-scoped logger orchestrator.Run creates later — also fans out
+		// warn+ records to the TUI log panel via logCh.
+		var logCh chan logging.LogLine
+		if useTUI {
+			logCh = make(chan logging.LogLine, 256)
+			tuiHandler := logging.NewTUIHandler(logCh, slog.LevelWarn)
+			origFactory := logFactory
+			logFactory = func(dir string) (*slog.Logger, error) {
+				l, err := origFactory(dir)
+				if err != nil {
+					return nil, err
+				}
+				return slog.New(logging.WithHandler(l.Handler(), tuiHandler)), nil
+			}
+		}
+
 		// Use a private temp directory for bootstrap logging. The orchestrator will
 		// create a logger in the run directory once the RunDataWriter is set up.
 		// Always remove the temp dir on exit so bootstrap logs don't accumulate.
@@ -117,7 +134,7 @@ Use "godark implement" to process individual issues by number.`,
 			// Metadata fields (milestone, timestamp, etc.) are populated later
 			// via RunStartedMsg once the orchestrator creates the run directory.
 			model := tui.New(cfg.Repo, milestone, "", cfg.BaseBranch,
-				string(cfg.AutoMerge.Feature), string(cfg.AutoMerge.Rollup), cancel, nil)
+				string(cfg.AutoMerge.Feature), string(cfg.AutoMerge.Rollup), cancel, logCh)
 			program := tea.NewProgram(model, tea.WithAltScreen())
 			reporter := tui.NewTUIReporter(program)
 
@@ -127,6 +144,9 @@ Use "godark implement" to process individual issues by number.`,
 				if err != nil || !watchFlag {
 					errCh <- err
 					program.Send(tui.RunDoneMsg{})
+					if logCh != nil {
+						close(logCh)
+					}
 					return
 				}
 				// Signal the TUI that we are entering watch mode; the spinner keeps
@@ -135,6 +155,9 @@ Use "godark implement" to process individual issues by number.`,
 				watchErr := runEnterWatch(tuiCtx, cfg, runMode, logger, milestone, reporter)
 				errCh <- watchErr
 				program.Send(tui.RunDoneMsg{})
+				if logCh != nil {
+					close(logCh)
+				}
 			}()
 
 			_, _ = program.Run()
