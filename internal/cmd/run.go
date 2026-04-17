@@ -117,7 +117,7 @@ Use "godark implement" to process individual issues by number.`,
 			// Metadata fields (milestone, timestamp, etc.) are populated later
 			// via RunStartedMsg once the orchestrator creates the run directory.
 			model := tui.New(cfg.Repo, milestone, "", cfg.BaseBranch,
-				string(cfg.AutoMerge.Feature), string(cfg.AutoMerge.Rollup), cancel)
+				string(cfg.AutoMerge.Feature), string(cfg.AutoMerge.Rollup), cancel, nil)
 			program := tea.NewProgram(model, tea.WithAltScreen())
 			reporter := tui.NewTUIReporter(program)
 

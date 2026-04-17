@@ -6,7 +6,10 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/peter-stratton/dark-factory/internal/logging"
 )
 
 // countdownTick returns a Cmd that fires a CountdownTickMsg after one second.
@@ -15,6 +18,26 @@ func countdownTick() tea.Cmd {
 		return CountdownTickMsg{}
 	})
 }
+
+// waitForLog returns a Cmd that blocks on ch and emits a LogMsg when a line
+// arrives. Returns nil when ch is nil so callers without a log channel skip
+// the subscription entirely. When ch closes, the inner func returns nil which
+// bubbletea treats as no message, ending the subscription cleanly.
+func waitForLog(ch <-chan logging.LogLine) tea.Cmd {
+	if ch == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		line, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return LogMsg{Line: line}
+	}
+}
+
+// maxLogLines bounds the in-memory log ring buffer.
+const maxLogLines = 100
 
 // autoMerge holds the feature and rollup branch names used for auto-merge.
 // A nil pointer means auto-merge is not configured.
@@ -65,6 +88,11 @@ type Model struct {
 	issueIndex     map[int]int   // issue number → index in issues slice
 	detailMessages []detailEntry // last 5 error/judge messages shown in the detail panel
 
+	// Log panel state.
+	logView viewport.Model
+	logs    []string                // ring buffer, capped at maxLogLines
+	logCh   <-chan logging.LogLine  // nil disables the subscription
+
 	// Spinner for in-progress rows.
 	spinner spinner.Model
 
@@ -85,9 +113,13 @@ type Model struct {
 var _ tea.Model = Model{}
 
 // Init implements tea.Model. Returns the spinner tick command so animation
-// starts immediately.
+// starts immediately, batched with the log subscription when a channel is
+// configured.
 func (m Model) Init() tea.Cmd {
-	return m.spinner.Tick
+	if m.logCh == nil {
+		return m.spinner.Tick
+	}
+	return tea.Batch(m.spinner.Tick, waitForLog(m.logCh))
 }
 
 // Update implements tea.Model. Handles window-size messages, spinner ticks,
@@ -116,14 +148,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case CountdownTickMsg:
-		if m.rateLimited {
-			return m, countdownTick()
-		}
-		return m, nil
+		return m.handleCountdownTick()
 
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
+		m.handleWindowSize(msg)
+
+	case LogMsg:
+		return m.handleLog(msg)
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -180,6 +211,7 @@ func (m Model) View() string {
 	}
 	divider := dividerStyle.Render(strings.Repeat("─", divWidth/2))
 	detail := renderDetailPanel(m.detailMessages, divWidth)
+	logs := renderLogPanel(m.logView, len(m.logs), divWidth)
 
 	var hint string
 	if m.done {
@@ -201,18 +233,23 @@ func (m Model) View() string {
 		hint = "\n\n" + headerLabelStyle.Render("press ctrl+c to cancel")
 	}
 
+	logsSegment := ""
+	if logs != "" {
+		logsSegment = logs + "\n\n"
+	}
+
 	if table == "" {
 		if detail == "" {
-			return header + "\n\n" + divider + "\n\n" + summary + hint + "\n"
+			return header + "\n\n" + logsSegment + divider + "\n\n" + summary + hint + "\n"
 		}
 		// detail already opens with a divider; this divider closes it.
-		return header + "\n\n" + detail + "\n\n" + divider + "\n\n" + summary + hint + "\n"
+		return header + "\n\n" + detail + "\n\n" + logsSegment + divider + "\n\n" + summary + hint + "\n"
 	}
 	if detail == "" {
-		return header + "\n\n" + table + "\n\n" + divider + "\n\n" + summary + hint + "\n"
+		return header + "\n\n" + table + "\n\n" + logsSegment + divider + "\n\n" + summary + hint + "\n"
 	}
 	// detail already opens with a divider; this divider closes it.
-	return header + "\n\n" + table + "\n\n" + detail + "\n\n" + divider + "\n\n" + summary + hint + "\n"
+	return header + "\n\n" + table + "\n\n" + detail + "\n\n" + logsSegment + divider + "\n\n" + summary + hint + "\n"
 }
 
 // renderDetailPanel renders the last N error and judge messages with an
@@ -243,13 +280,27 @@ func renderDetailPanel(entries []detailEntry, width int) string {
 	return strings.Join(lines, "\n")
 }
 
+// renderLogPanel renders the log viewport with a short divider+label header.
+// Returns "" when count is zero so the caller can omit the block entirely
+// (matches renderDetailPanel's convention so View()'s assembly stays simple).
+func renderLogPanel(view viewport.Model, count, width int) string {
+	if count == 0 {
+		return ""
+	}
+	header := dividerStyle.Render(strings.Repeat("─", width/2)) + " log"
+	return header + "\n" + view.View()
+}
+
 // New returns a Model pre-populated with run metadata.
 //
 // cancelFn is called when the user presses ctrl+c during an active run to
 // cancel the orchestrator's context. It may be nil (cancellation disabled).
 // mergeFeature and mergeRollup may be empty strings when auto-merge is not
 // configured. baseBranch may be empty when using the repository default.
-func New(repo, milestone, timestamp, baseBranch, mergeFeature, mergeRollup string, cancelFn func()) Model {
+//
+// logCh feeds log lines into the scrollable log panel. A nil channel disables
+// the subscription (the panel stays hidden because no LogMsg is ever appended).
+func New(repo, milestone, timestamp, baseBranch, mergeFeature, mergeRollup string, cancelFn func(), logCh <-chan logging.LogLine) Model {
 	spin := spinner.New()
 	spin.Spinner = spinner.Dot
 
@@ -260,6 +311,8 @@ func New(repo, milestone, timestamp, baseBranch, mergeFeature, mergeRollup strin
 		baseBranch: baseBranch,
 		cancelFn:   cancelFn,
 		spinner:    spin,
+		logView:    viewport.New(0, 0),
+		logCh:      logCh,
 	}
 	if mergeFeature != "" || mergeRollup != "" {
 		m.autoMerge = &autoMerge{
@@ -271,8 +324,17 @@ func New(repo, milestone, timestamp, baseBranch, mergeFeature, mergeRollup strin
 }
 
 // handleKey processes key presses. During an active run, ctrl+c cancels the
-// orchestrator. Once done, q/esc/ctrl+c exit the TUI.
+// orchestrator. Once done, q/esc/ctrl+c exit the TUI. Scroll keys are
+// forwarded to the log viewport before the lifecycle switch so they do not
+// collide with the q/esc/ctrl+c handlers.
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "pgup", "pgdown", "home", "end", "j", "k":
+		var cmd tea.Cmd
+		m.logView, cmd = m.logView.Update(msg)
+		return m, cmd
+	}
+
 	switch msg.String() {
 	case "ctrl+c":
 		if m.done {
@@ -288,6 +350,40 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// handleCountdownTick reschedules the tick while the rate limit hold is active.
+func (m Model) handleCountdownTick() (tea.Model, tea.Cmd) {
+	if m.rateLimited {
+		return m, countdownTick()
+	}
+	return m, nil
+}
+
+// handleWindowSize stores terminal dimensions and resizes the log viewport.
+func (m *Model) handleWindowSize(msg tea.WindowSizeMsg) {
+	m.width = msg.Width
+	m.height = msg.Height
+	logHeight := 6
+	if msg.Height < 20 {
+		logHeight = 3
+	}
+	m.logView.Width = msg.Width
+	m.logView.Height = logHeight
+}
+
+// handleLog appends a log line to the ring buffer and re-subscribes to the channel.
+func (m Model) handleLog(msg LogMsg) (tea.Model, tea.Cmd) {
+	m.logs = append(m.logs, msg.Line.Formatted)
+	if len(m.logs) > maxLogLines {
+		m.logs = m.logs[len(m.logs)-maxLogLines:]
+	}
+	atBottom := m.logView.AtBottom()
+	m.logView.SetContent(strings.Join(m.logs, "\n"))
+	if atBottom {
+		m.logView.GotoBottom()
+	}
+	return m, waitForLog(m.logCh)
 }
 
 // handleIssueStageChanged updates the stage for an in-progress issue.

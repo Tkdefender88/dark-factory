@@ -1,11 +1,14 @@
 package tui
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/peter-stratton/dark-factory/internal/logging"
 )
 
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
@@ -30,6 +33,7 @@ func TestRenderHeaderFullMetadata(t *testing.T) {
 		"main",
 		"feature/phase-20",
 		"rollup/phase-20",
+		nil,
 		nil,
 	)
 	got := stripANSI(renderHeader(m))
@@ -64,6 +68,7 @@ func TestRenderHeaderMinimal(t *testing.T) {
 		"", // no base branch
 		"", // no auto-merge
 		"",
+		nil,
 		nil,
 	)
 	got := stripANSI(renderHeader(m))
@@ -160,6 +165,7 @@ func TestModelViewContainsHeaderAndSummary(t *testing.T) {
 		"",
 		"",
 		nil,
+		nil,
 	)
 	got := stripANSI(m.View())
 
@@ -179,7 +185,7 @@ func TestModelViewContainsHeaderAndSummary(t *testing.T) {
 // --- New constructor tests ---
 
 func TestNewAutoMergePopulated(t *testing.T) {
-	m := New("repo", "ms", "ts", "base", "feat-branch", "rollup-branch", nil)
+	m := New("repo", "ms", "ts", "base", "feat-branch", "rollup-branch", nil, nil)
 	if m.autoMerge == nil {
 		t.Fatal("autoMerge should be non-nil when mergeFeature is set")
 	}
@@ -192,7 +198,7 @@ func TestNewAutoMergePopulated(t *testing.T) {
 }
 
 func TestNewAutoMergeNilWhenEmpty(t *testing.T) {
-	m := New("repo", "ms", "ts", "", "", "", nil)
+	m := New("repo", "ms", "ts", "", "", "", nil, nil)
 	if m.autoMerge != nil {
 		t.Errorf("autoMerge should be nil when both merge fields are empty, got %+v", m.autoMerge)
 	}
@@ -418,7 +424,7 @@ func TestDetailPanelCappedAtFive(t *testing.T) {
 }
 
 func TestDetailPanelEmptyHidesPanel(t *testing.T) {
-	m := New("repo", "ms", "ts", "", "", "", nil)
+	m := New("repo", "ms", "ts", "", "", "", nil, nil)
 	m.width = 80
 	got := stripANSI(m.View())
 
@@ -565,5 +571,197 @@ func TestRenderDetailPanelContent(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("renderDetailPanel: %q not found in output\ngot: %q", want, got)
 		}
+	}
+}
+
+// --- Log panel tests ---
+
+func TestLogMsgAppendsToRing(t *testing.T) {
+	m := New("repo", "ms", "ts", "", "", "", nil, nil)
+	next, _ := m.Update(LogMsg{Line: logging.LogLine{Formatted: "x"}})
+	updated := next.(Model)
+
+	if len(updated.logs) != 1 {
+		t.Fatalf("logs length: got %d, want 1", len(updated.logs))
+	}
+	if updated.logs[0] != "x" {
+		t.Errorf("logs[0]: got %q, want %q", updated.logs[0], "x")
+	}
+}
+
+func TestLogRingBufferTruncates(t *testing.T) {
+	m := New("repo", "ms", "ts", "", "", "", nil, nil)
+	var current tea.Model = m
+	for i := 0; i < 150; i++ {
+		next, _ := current.(Model).Update(LogMsg{Line: logging.LogLine{Formatted: fmt.Sprintf("line-%d", i)}})
+		current = next
+	}
+	final := current.(Model)
+
+	if len(final.logs) != 100 {
+		t.Errorf("logs length after 150 sends: got %d, want 100", len(final.logs))
+	}
+	// The first entry retained should be the 51st line sent (index 50).
+	want := "line-50"
+	if final.logs[0] != want {
+		t.Errorf("logs[0]: got %q, want %q", final.logs[0], want)
+	}
+}
+
+func TestLogPanelHiddenWhenEmpty(t *testing.T) {
+	m := New("repo", "ms", "ts", "", "", "", nil, nil)
+	m.width = 80
+	got := stripANSI(m.View())
+
+	// renderLogPanel emits "─... log" when populated; when empty, neither the
+	// header text nor a second divider line should be present.
+	if strings.Contains(got, "─ log") || strings.Contains(got, " log\n") {
+		t.Errorf("View with no logs: log panel header should be absent\ngot: %q", got)
+	}
+}
+
+func TestLogPanelRenderedWhenNonEmpty(t *testing.T) {
+	m := New("repo", "ms", "ts", "", "", "", nil, nil)
+	m.width = 80
+	// Seed dimensions so the viewport can render content.
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 40})
+	withSize := next.(Model)
+	next2, _ := withSize.Update(LogMsg{Line: logging.LogLine{Formatted: "warn: something happened"}})
+	final := next2.(Model)
+
+	got := stripANSI(final.View())
+	if !strings.Contains(got, " log") {
+		t.Errorf("View after LogMsg: log panel header missing\ngot: %q", got)
+	}
+	if !strings.Contains(got, "warn: something happened") {
+		t.Errorf("View after LogMsg: formatted line missing\ngot: %q", got)
+	}
+}
+
+func TestLogStickToBottom(t *testing.T) {
+	m := New("repo", "ms", "ts", "", "", "", nil, nil)
+	// Size the viewport small (3 rows) and feed enough lines to enable scrolling.
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 10})
+	current := next.(Model)
+	for i := 0; i < 20; i++ {
+		n, _ := current.Update(LogMsg{Line: logging.LogLine{Formatted: fmt.Sprintf("line-%d", i)}})
+		current = n.(Model)
+	}
+
+	if !current.logView.AtBottom() {
+		t.Errorf("logView should remain at bottom after appending without user scroll")
+	}
+}
+
+func TestLogPreserveScroll(t *testing.T) {
+	m := New("repo", "ms", "ts", "", "", "", nil, nil)
+	// Small viewport with scrollable content.
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 10})
+	current := next.(Model)
+	for i := 0; i < 20; i++ {
+		n, _ := current.Update(LogMsg{Line: logging.LogLine{Formatted: fmt.Sprintf("line-%d", i)}})
+		current = n.(Model)
+	}
+	// Scroll up by 2 lines using ScrollUp directly on the viewport.
+	current.logView.ScrollUp(2)
+	if current.logView.AtBottom() {
+		t.Fatalf("test setup: viewport should not be at bottom after ScrollUp(2)")
+	}
+	beforeOffset := current.logView.YOffset
+
+	n, _ := current.Update(LogMsg{Line: logging.LogLine{Formatted: "newest"}})
+	final := n.(Model)
+
+	if final.logView.AtBottom() {
+		t.Errorf("logView.AtBottom: got true, want false (user scrolled up)")
+	}
+	if final.logView.YOffset != beforeOffset {
+		t.Errorf("logView.YOffset: got %d, want %d (scroll position should be preserved)", final.logView.YOffset, beforeOffset)
+	}
+}
+
+func TestNilLogChannelDisablesSubscription(t *testing.T) {
+	m := New("repo", "ms", "ts", "", "", "", nil, nil)
+	cmd := m.Init()
+	if cmd == nil {
+		t.Fatal("Init: returned nil cmd, expected at least the spinner tick")
+	}
+	// With logCh=nil, Init must not batch waitForLog. The bubbletea Batch
+	// returns a BatchMsg-emitting Cmd; the spinner tick alone is a single Cmd.
+	// A nil channel surfaces here as: waitForLog(nil) returns nil, so Init's
+	// branch returns m.spinner.Tick directly. We assert the value matches.
+	spinTick := m.spinner.Tick
+	cmdMsg := cmd()
+	tickMsg := spinTick()
+	if fmt.Sprintf("%T", cmdMsg) != fmt.Sprintf("%T", tickMsg) {
+		t.Errorf("Init with nil logCh: expected raw spinner tick (%T), got %T", tickMsg, cmdMsg)
+	}
+}
+
+func TestLogChannelInitBatchesSubscription(t *testing.T) {
+	ch := make(chan logging.LogLine, 1)
+	m := New("repo", "ms", "ts", "", "", "", nil, ch)
+	cmd := m.Init()
+	if cmd == nil {
+		t.Fatal("Init with logCh: returned nil cmd")
+	}
+	// Batched cmd should produce a tea.BatchMsg when invoked.
+	msg := cmd()
+	if _, ok := msg.(tea.BatchMsg); !ok {
+		t.Errorf("Init with non-nil logCh: expected tea.BatchMsg, got %T", msg)
+	}
+}
+
+func TestWindowSizeSetsLogViewportDimensions(t *testing.T) {
+	m := New("repo", "ms", "ts", "", "", "", nil, nil)
+	// Normal terminal: 6 rows.
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+	updated := next.(Model)
+	if updated.logView.Width != 100 {
+		t.Errorf("logView.Width: got %d, want 100", updated.logView.Width)
+	}
+	if updated.logView.Height != 6 {
+		t.Errorf("logView.Height: got %d, want 6", updated.logView.Height)
+	}
+
+	// Short terminal: 3 rows.
+	next2, _ := updated.Update(tea.WindowSizeMsg{Width: 100, Height: 15})
+	short := next2.(Model)
+	if short.logView.Height != 3 {
+		t.Errorf("logView.Height (short term): got %d, want 3", short.logView.Height)
+	}
+}
+
+func TestViewportScrollKeysForwarded(t *testing.T) {
+	m := New("repo", "ms", "ts", "", "", "", nil, nil)
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 10})
+	current := next.(Model)
+	for i := 0; i < 20; i++ {
+		n, _ := current.Update(LogMsg{Line: logging.LogLine{Formatted: fmt.Sprintf("line-%d", i)}})
+		current = n.(Model)
+	}
+	if !current.logView.AtBottom() {
+		t.Fatalf("test setup: viewport should be at bottom before scrolling")
+	}
+
+	// Forward "pgup" through handleKey and confirm the viewport scrolled.
+	next2, _ := current.handleKey(tea.KeyMsg{Type: tea.KeyPgUp})
+	scrolled := next2.(Model)
+	if scrolled.logView.AtBottom() {
+		t.Errorf("pgup did not scroll the log viewport (AtBottom remained true)")
+	}
+}
+
+func TestLifecycleKeysNotForwardedToViewport(t *testing.T) {
+	cancelCalled := false
+	m := New("repo", "ms", "ts", "", "", "", func() { cancelCalled = true }, nil)
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlC})
+	updated := next.(Model)
+
+	if !updated.cancelling {
+		t.Error("ctrl+c should set cancelling = true (lifecycle, not viewport)")
+	}
+	if !cancelCalled {
+		t.Error("ctrl+c should invoke cancelFn")
 	}
 }
