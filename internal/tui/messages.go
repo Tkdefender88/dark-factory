@@ -1,6 +1,10 @@
 package tui
 
-import "time"
+import (
+	"time"
+
+	"github.com/peter-stratton/dark-factory/internal/logging"
+)
 
 // IssueStartedMsg is sent when the orchestrator begins processing an issue.
 type IssueStartedMsg struct {
@@ -103,3 +107,9 @@ type WorkersActiveMsg struct {
 
 // CountdownTickMsg is sent every second while rate-limited to drive the TUI countdown.
 type CountdownTickMsg struct{}
+
+// LogMsg is emitted by the log-subscription tea.Cmd when a new log line
+// arrives on the channel passed into New(...).
+type LogMsg struct {
+	Line logging.LogLine
+}

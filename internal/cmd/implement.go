@@ -198,7 +198,7 @@ Issue numbers may be provided as positional arguments, via --issues, or both.`,
 		if useTUI {
 			ctx, cancelRun = context.WithCancel(ctx)
 			model := tui.New(cfg.Repo, "", "", cfg.BaseBranch,
-				string(cfg.AutoMerge.Feature), string(cfg.AutoMerge.Rollup), cancelRun)
+				string(cfg.AutoMerge.Feature), string(cfg.AutoMerge.Rollup), cancelRun, nil)
 			program = tea.NewProgram(model, tea.WithAltScreen())
 			reporter = tui.NewTUIReporter(program)
 		} else {
