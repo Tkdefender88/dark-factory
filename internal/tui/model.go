@@ -148,32 +148,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case CountdownTickMsg:
-		if m.rateLimited {
-			return m, countdownTick()
-		}
-		return m, nil
+		return m.handleCountdownTick()
 
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		logHeight := 6
-		if msg.Height < 20 {
-			logHeight = 3
-		}
-		m.logView.Width = msg.Width
-		m.logView.Height = logHeight
+		m.handleWindowSize(msg)
 
 	case LogMsg:
-		m.logs = append(m.logs, msg.Line.Formatted)
-		if len(m.logs) > maxLogLines {
-			m.logs = m.logs[len(m.logs)-maxLogLines:]
-		}
-		atBottom := m.logView.AtBottom()
-		m.logView.SetContent(strings.Join(m.logs, "\n"))
-		if atBottom {
-			m.logView.GotoBottom()
-		}
-		return m, waitForLog(m.logCh)
+		return m.handleLog(msg)
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -369,6 +350,40 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// handleCountdownTick reschedules the tick while the rate limit hold is active.
+func (m Model) handleCountdownTick() (tea.Model, tea.Cmd) {
+	if m.rateLimited {
+		return m, countdownTick()
+	}
+	return m, nil
+}
+
+// handleWindowSize stores terminal dimensions and resizes the log viewport.
+func (m *Model) handleWindowSize(msg tea.WindowSizeMsg) {
+	m.width = msg.Width
+	m.height = msg.Height
+	logHeight := 6
+	if msg.Height < 20 {
+		logHeight = 3
+	}
+	m.logView.Width = msg.Width
+	m.logView.Height = logHeight
+}
+
+// handleLog appends a log line to the ring buffer and re-subscribes to the channel.
+func (m Model) handleLog(msg LogMsg) (tea.Model, tea.Cmd) {
+	m.logs = append(m.logs, msg.Line.Formatted)
+	if len(m.logs) > maxLogLines {
+		m.logs = m.logs[len(m.logs)-maxLogLines:]
+	}
+	atBottom := m.logView.AtBottom()
+	m.logView.SetContent(strings.Join(m.logs, "\n"))
+	if atBottom {
+		m.logView.GotoBottom()
+	}
+	return m, waitForLog(m.logCh)
 }
 
 // handleIssueStageChanged updates the stage for an in-progress issue.
