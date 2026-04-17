@@ -45,4 +45,5 @@
 - [Phase 36: Structured Frontend Issue Decomposition](phase-36.md)
 - [Phase 37: Benchmarking Framework](phase-37.md)
 - [Phase 38: Security-Aware Review & Prompt Auditability](phase-38.md)
+- [Phase 39: TUI Log Viewer](phase-39.md)
 - [Future considerations](future-considerations.md)
