@@ -87,7 +87,12 @@ func NewLogger(dir string) (*slog.Logger, error) {
 	}
 	textHandler := slog.NewTextHandler(stdout, &slog.HandlerOptions{Level: slog.LevelDebug})
 
-	return slog.New(&multiHandler{json: jsonHandler, text: textHandler}), nil
+	return slog.New(&multiHandler{handlers: []slog.Handler{jsonHandler, textHandler}}), nil
+}
+
+// WithHandler returns a slog.Handler that fans out records to base and extra.
+func WithHandler(base, extra slog.Handler) slog.Handler {
+	return &multiHandler{handlers: []slog.Handler{base, extra}}
 }
 
 // colorWriter wraps a writer and applies ANSI color to log lines that contain
@@ -133,31 +138,39 @@ func verdictColor(line string) string {
 
 // multiHandler fans out log records to multiple handlers.
 type multiHandler struct {
-	json slog.Handler
-	text slog.Handler
+	handlers []slog.Handler
 }
 
 func (h *multiHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return h.json.Enabled(ctx, level) || h.text.Enabled(ctx, level)
+	for _, inner := range h.handlers {
+		if inner.Enabled(ctx, level) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *multiHandler) Handle(ctx context.Context, r slog.Record) error {
-	if err := h.json.Handle(ctx, r); err != nil {
-		return err
+	for _, inner := range h.handlers {
+		if err := inner.Handle(ctx, r); err != nil {
+			return err
+		}
 	}
-	return h.text.Handle(ctx, r)
+	return nil
 }
 
 func (h *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &multiHandler{
-		json: h.json.WithAttrs(attrs),
-		text: h.text.WithAttrs(attrs),
+	next := make([]slog.Handler, len(h.handlers))
+	for i, inner := range h.handlers {
+		next[i] = inner.WithAttrs(attrs)
 	}
+	return &multiHandler{handlers: next}
 }
 
 func (h *multiHandler) WithGroup(name string) slog.Handler {
-	return &multiHandler{
-		json: h.json.WithGroup(name),
-		text: h.text.WithGroup(name),
+	next := make([]slog.Handler, len(h.handlers))
+	for i, inner := range h.handlers {
+		next[i] = inner.WithGroup(name)
 	}
+	return &multiHandler{handlers: next}
 }
